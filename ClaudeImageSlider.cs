@@ -4,19 +4,24 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 
-// Matches pixels with StrokesPlus.net's own FindImageWithinImage function.
-// Capture and input run only when the user presses a configured hotkey.
+// All screenshots and clicks run only during a user-triggered hotkey.
 internal static class ClaudeImageSlider
 {
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect { internal int Left, Top, Right, Bottom; }
     private static readonly Rectangle referenceAnchor = new Rectangle(15, 61, 196, 14);
+    private static Bitmap runtimeNeedle;
+    private static Rectangle runtimeSearchArea = Rectangle.Empty;
     internal static Rectangle PopupBounds { get; private set; }
 
-    private static object Match(Bitmap needle, Bitmap haystack)
+    private static object Match(Bitmap needle, Bitmap haystack) { return StrokesImageSearch.Match(needle, haystack); }
+    private static Bitmap RuntimeNeedle()
     {
-        return StrokesImageSearch.Match(needle, haystack);
+        if (runtimeNeedle == null)
+            using (Image reference = Image.FromFile(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Claude-effort-reference.png")))
+                runtimeNeedle = Anchor(reference);
+        return runtimeNeedle;
     }
     private static Bitmap Anchor(Image reference)
     {
@@ -27,36 +32,89 @@ internal static class ClaudeImageSlider
             graphics.DrawImage(reference, new Rectangle(0, 0, result.Width, result.Height), referenceAnchor, GraphicsUnit.Pixel);
         return result;
     }
+    private static Rectangle PopupSearchArea(Point anchor)
+    {
+        return new Rectangle(anchor.X - 45, anchor.Y - 85, 320, 180);
+    }
+    internal static void ExpectNearButton(IntPtr hwnd, Rectangle button)
+    {
+        NativeRect bounds;
+        if (GetWindowRect(hwnd, out bounds))
+            runtimeSearchArea = new Rectangle(button.X - bounds.Left - 260,
+                button.Y - bounds.Top - 240, button.Width + 520, button.Height + 440);
+    }
+    private static Rectangle SearchArea(Size window, bool full)
+    {
+        Rectangle whole = new Rectangle(Point.Empty, window);
+        Rectangle area = full || runtimeSearchArea.IsEmpty ? whole : Rectangle.Intersect(whole, runtimeSearchArea);
+        return area.IsEmpty ? whole : area;
+    }
+    private static Bitmap Capture(IntPtr hwnd, bool full, out Point origin, out Point windowOrigin)
+    {
+        NativeRect bounds;
+        if (!GetWindowRect(hwnd, out bounds)) throw new InvalidOperationException("Cannot read Claude window bounds.");
+        int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
+        if (width < referenceAnchor.Width || height < 100)
+            throw new InvalidOperationException("Claude window is too small to locate the slider.");
+        windowOrigin = new Point(bounds.Left, bounds.Top);
+        Rectangle area = SearchArea(new Size(width, height), full);
+        origin = new Point(bounds.Left + area.X, bounds.Top + area.Y);
+        System.Diagnostics.Stopwatch captureTimer = System.Diagnostics.Stopwatch.StartNew();
+        Bitmap capture = new Bitmap(area.Width, area.Height, PixelFormat.Format24bppRgb);
+        try
+        {
+            using (Graphics graphics = Graphics.FromImage(capture))
+                graphics.CopyFromScreen(origin.X, origin.Y, 0, 0, capture.Size, CopyPixelOperation.SourceCopy);
+            StrokesImageSearch.RecordCapture(area.Width == width && area.Height == height, captureTimer.ElapsedMilliseconds);
+            return capture;
+        }
+        catch { capture.Dispose(); throw; }
+    }
+    private static bool TryCapturePopup(IntPtr hwnd, out Bitmap capture, out Point origin, out Point anchor)
+    {
+        capture = null; origin = Point.Empty; anchor = Point.Empty;
+        bool firstIsFull = runtimeSearchArea.IsEmpty;
+        for (int attempt = 0; attempt < (firstIsFull ? 1 : 2); attempt++)
+        {
+            Point windowOrigin;
+            Bitmap candidate = Capture(hwnd, firstIsFull || attempt == 1, out origin, out windowOrigin);
+            try
+            {
+                object match = Match(RuntimeNeedle(), candidate);
+                if (match != null)
+                {
+                    anchor = (Point)match;
+                    PopupBounds = new Rectangle(origin.X + anchor.X - 15, origin.Y + anchor.Y - 61, 224, 145);
+                    runtimeSearchArea = PopupSearchArea(new Point(origin.X + anchor.X - windowOrigin.X,
+                        origin.Y + anchor.Y - windowOrigin.Y));
+                    capture = candidate;
+                    return true;
+                }
+            }
+            catch { candidate.Dispose(); throw; }
+            candidate.Dispose();
+        }
+        return false;
+    }
     private static Point TargetPoint(Point anchor, int target)
     {
         if (target < 0 || target > 5) throw new ArgumentOutOfRangeException("target");
-        // The screenshot's High thumb is x=95. Stops are 35px apart.
         // Low, Medium, High, Extra, Max, Ultracode: x=25,60,95,130,165,200.
         return new Point(anchor.X + 10 + 35 * target, anchor.Y + 35);
     }
     internal static bool TryLocate(IntPtr hwnd, int current, int target, out Point screenPoint)
     {
         screenPoint = Point.Empty;
-        NativeRect bounds;
-        if (!GetWindowRect(hwnd, out bounds)) throw new InvalidOperationException("Cannot read Claude window bounds.");
-        int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
-        if (width < referenceAnchor.Width || height < 100) return false;
-        using (Image reference = Image.FromFile(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Claude-effort-reference.png")))
-        using (Bitmap needle = Anchor(reference))
-        using (Bitmap capture = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+        Point origin, anchor;
+        Bitmap capture;
+        if (!TryCapturePopup(hwnd, out capture, out origin, out anchor)) return false;
+        using (capture)
         {
-            using (Graphics graphics = Graphics.FromImage(capture))
-                graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, capture.Size, CopyPixelOperation.SourceCopy);
-            object match = Match(needle, capture);
-            if (match == null) return false;
-            Point anchor = (Point)match;
-            PopupBounds = new Rectangle(bounds.Left + anchor.X - 15, bounds.Top + anchor.Y - 61, 224, 145);
-            Point expectedThumb = TargetPoint(anchor, current);
-            if (!ThumbAt(capture, expectedThumb, current))
+            if (!ThumbAt(capture, TargetPoint(anchor, current), current))
                 throw new InvalidOperationException("Claude's slider thumb does not match its reported effort; no click sent.");
             Point click = TargetPoint(anchor, target);
             if (click.X < 0 || click.Y < 0 || click.X >= capture.Width || click.Y >= capture.Height) return false;
-            screenPoint = new Point(bounds.Left + click.X, bounds.Top + click.Y);
+            screenPoint = new Point(origin.X + click.X, origin.Y + click.Y);
             return true;
         }
     }
@@ -69,7 +127,6 @@ internal static class ClaudeImageSlider
                 Color color = capture.GetPixel(point.X + x, point.Y + y);
                 if (color.R < 245 || color.G < 245 || color.B < 245) return false;
             }
-        // End stops have background on the outside; check only inside the track.
         foreach (int offset in new[] { -12, 12 })
         {
             if ((stop == 0 && offset < 0) || (stop == 5 && offset > 0)) continue;
@@ -80,18 +137,11 @@ internal static class ClaudeImageSlider
     }
     internal static bool IsPopupVisible(IntPtr hwnd)
     {
-        NativeRect bounds;
-        if (!GetWindowRect(hwnd, out bounds)) return false;
-        int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
-        if (width < referenceAnchor.Width || height < 100) return false;
-        using (Image reference = Image.FromFile(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Claude-effort-reference.png")))
-        using (Bitmap needle = Anchor(reference))
-        using (Bitmap capture = new Bitmap(width, height, PixelFormat.Format24bppRgb))
-        {
-            using (Graphics graphics = Graphics.FromImage(capture))
-                graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, capture.Size, CopyPixelOperation.SourceCopy);
-            return Match(needle, capture) != null;
-        }
+        Point origin, anchor;
+        Bitmap capture;
+        if (!TryCapturePopup(hwnd, out capture, out origin, out anchor)) return false;
+        capture.Dispose();
+        return true;
     }
     private static int ReadThumb(Bitmap capture, Point anchor)
     {
@@ -107,26 +157,37 @@ internal static class ClaudeImageSlider
     internal static bool TryReadCurrent(IntPtr hwnd, out int current)
     {
         current = -1;
-        NativeRect bounds;
-        if (!GetWindowRect(hwnd, out bounds)) return false;
-        int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
-        if (width < referenceAnchor.Width || height < 100) return false;
-        using (Image reference = Image.FromFile(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Claude-effort-reference.png")))
-        using (Bitmap needle = Anchor(reference))
-        using (Bitmap capture = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+        Point origin, anchor;
+        Bitmap capture;
+        if (!TryCapturePopup(hwnd, out capture, out origin, out anchor)) return false;
+        using (capture) current = ReadThumb(capture, anchor);
+        return true;
+    }
+    private static void SearchAreaSelfTest()
+    {
+        Rectangle previous = runtimeSearchArea;
+        try
         {
-            using (Graphics graphics = Graphics.FromImage(capture))
-                graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, capture.Size, CopyPixelOperation.SourceCopy);
-            object match = Match(needle, capture);
-            if (match == null) return false;
-            Point anchor = (Point)match;
-            PopupBounds = new Rectangle(bounds.Left + anchor.X - 15, bounds.Top + anchor.Y - 61, 224, 145);
-            current = ReadThumb(capture, anchor);
-            return true;
+            Point anchor = new Point(88, 108);
+            runtimeSearchArea = PopupSearchArea(anchor);
+            Rectangle area = SearchArea(new Size(400, 300), false);
+            for (int stop = 0; stop < 6; stop++)
+                if (!area.Contains(TargetPoint(anchor, stop)))
+                    throw new InvalidOperationException("Claude cropped search clipped a slider stop.");
+            if (!area.Contains(new Rectangle(anchor, referenceAnchor.Size)) || area.Width > 320 || area.Height > 180)
+                throw new InvalidOperationException("Claude cropped search did not contain the anchor.");
+            runtimeSearchArea = new Rectangle(-30, -20, 320, 180);
+            if (SearchArea(new Size(400, 300), false) != new Rectangle(0, 0, 290, 160))
+                throw new InvalidOperationException("Claude edge crop was not clipped to the window.");
+            runtimeSearchArea = new Rectangle(800, 600, 320, 180);
+            if (SearchArea(new Size(400, 300), false) != new Rectangle(0, 0, 400, 300))
+                throw new InvalidOperationException("Claude stale search area did not recover the full window.");
         }
+        finally { runtimeSearchArea = previous; }
     }
     internal static bool SelfTest()
     {
+        SearchAreaSelfTest();
         // No screen capture, app access, mouse or keyboard input in this test.
         using (Image reference = Image.FromFile(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Claude-effort-reference.png")))
         using (Bitmap needle = Anchor(reference))
@@ -160,6 +221,19 @@ internal static class ClaudeImageSlider
                 if (TargetPoint(anchor, stop) != new Point(centers[stop], 143) ||
                     !ThumbAt(canvas, new Point(centers[stop], 143), stop) || ReadThumb(canvas, anchor) != stop)
                     throw new InvalidOperationException("Image selftest: stop " + stop + " failed.");
+                // The runtime crop must preserve the same stop and screen point.
+                Rectangle area = Rectangle.Intersect(PopupSearchArea(anchor), new Rectangle(Point.Empty, canvas.Size));
+                using (Bitmap cropped = canvas.Clone(area, PixelFormat.Format24bppRgb))
+                {
+                    object croppedMatch = Match(needle, cropped);
+                    if (croppedMatch == null || ReadThumb(cropped, (Point)croppedMatch) != stop)
+                        throw new InvalidOperationException("Claude cropped image lost stop " + stop + ".");
+                    Point localPoint = TargetPoint((Point)croppedMatch, stop);
+                    Point screenOrigin = new Point(-1920, 100);
+                    Point actual = new Point(screenOrigin.X + area.X + localPoint.X, screenOrigin.Y + area.Y + localPoint.Y);
+                    if (actual != new Point(screenOrigin.X + centers[stop], screenOrigin.Y + 143))
+                        throw new InvalidOperationException("Claude crop changed the screen coordinate for stop " + stop + ".");
+                }
                 for (int other = 0; other < 6; other++)
                     if (other != stop && ThumbAt(canvas, new Point(centers[other], 143), other))
                         throw new InvalidOperationException("Image selftest: wrong thumb accepted.");

@@ -11,9 +11,9 @@ if($output -ine [IO.Path]::GetFullPath($PSScriptRoot)){
 }
 $sources=@('ReasoningSwitch.cs','GptImageSlider.cs','ClaudeImageSlider.cs','StrokesImageSearch.cs') | ForEach-Object {Join-Path $PSScriptRoot $_}
 $next=Join-Path $output 'ReasoningSwitch.build.exe'
-& $compiler /nologo /target:winexe /platform:x64 ('/out:'+$next) ('/reference:'+(Join-Path $wpf 'UIAutomationClient.dll')) ('/reference:'+(Join-Path $wpf 'UIAutomationTypes.dll')) ('/reference:'+(Join-Path $wpf 'WindowsBase.dll')) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $sources
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ ('/out:'+$next) ('/reference:'+(Join-Path $wpf 'UIAutomationClient.dll')) ('/reference:'+(Join-Path $wpf 'UIAutomationTypes.dll')) ('/reference:'+(Join-Path $wpf 'WindowsBase.dll')) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $sources
 if($LASTEXITCODE -ne 0){throw 'Compilation failed; the existing helper was not replaced.'}
 $test=Start-Process -FilePath $next -ArgumentList '--selftest' -WindowStyle Hidden -PassThru -Wait
 if($test.ExitCode -ne 0){throw 'Self-test failed; see selftest-error.txt. The existing helper was not replaced.'}
 Move-Item -LiteralPath $next -Destination (Join-Path $output 'ReasoningSwitch.exe') -Force
-[pscustomobject]@{Build='17-gpt-confirmed-dismiss';SelfTest='passed';Executable=(Join-Path $output 'ReasoningSwitch.exe')}
+[pscustomobject]@{Build='18-reduced-search-work';SelfTest='passed';Executable=(Join-Path $output 'ReasoningSwitch.exe')}

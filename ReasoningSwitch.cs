@@ -27,7 +27,7 @@ internal static class ReasoningSwitch
     private static System.Windows.Rect chatInputWindowBounds = System.Windows.Rect.Empty;
     private static StringBuilder trace = new StringBuilder();
     private static Stopwatch operationTimer = Stopwatch.StartNew();
-    private const string BuildName = "17-gpt-confirmed-dismiss";
+    private const string BuildName = "18-reduced-search-work";
     private static readonly ControlType[] choiceTypes = {
         ControlType.RadioButton, ControlType.MenuItem, ControlType.ListItem,
         ControlType.CheckBox, ControlType.Button
@@ -61,10 +61,13 @@ internal static class ReasoningSwitch
                 if (app != "chatgpt" && app != "claude") return 0;
                 // Require a stable release; a transient release can occur between chords.
                 WaitForInputRelease();
+                trace.AppendLine("Initial key release at " + operationTimer.ElapsedMilliseconds + " ms.");
                 int direction = args[0] == "up" ? 1 : -1;
                 AutomationElement root = AutomationElement.FromHandle(targetWindow);
                 targetRoot = root;
+                Stopwatch inputTimer = Stopwatch.StartNew();
                 RememberChatInput(root);
+                trace.AppendLine("Chat input lookup=" + inputTimer.ElapsedMilliseconds + " ms.");
                 if (app == "chatgpt") SwitchCodex(root, direction);
                 else SwitchClaude(root, direction);
                 return 0;
@@ -117,6 +120,7 @@ internal static class ReasoningSwitch
     }
     private static AutomationElement[] Elements(AutomationElement root, ControlType type)
     {
+        Stopwatch queryTimer = Stopwatch.StartNew();
         System.Collections.Generic.List<AutomationElement> result = new System.Collections.Generic.List<AutomationElement>();
         {
             CacheRequest cache = new CacheRequest();
@@ -132,6 +136,7 @@ internal static class ReasoningSwitch
                     try { if (!element.Cached.IsOffscreen && element.Cached.IsEnabled) result.Add(element); } catch { }
             }
         }
+        trace.AppendLine("UIA " + type.ProgrammaticName + " lookup=" + queryTimer.ElapsedMilliseconds + " ms; visible=" + result.Count);
         return result.ToArray();
     }
     private static string Name(AutomationElement element)
@@ -146,8 +151,12 @@ internal static class ReasoningSwitch
     }
     private static AutomationElement ModelButton(AutomationElement root, string pattern)
     {
+        return ModelButton(Elements(root, ControlType.Button), pattern);
+    }
+    private static AutomationElement ModelButton(AutomationElement[] buttons, string pattern)
+    {
         AutomationElement found = null;
-        foreach (AutomationElement button in Elements(root, ControlType.Button))
+        foreach (AutomationElement button in buttons)
         {
             string name = Name(button);
             bool matches = Regex.IsMatch(name, pattern, RegexOptions.IgnoreCase);
@@ -309,8 +318,8 @@ internal static class ReasoningSwitch
             } while (openTimer.ElapsedMilliseconds < 1600);
             throw new InvalidOperationException("GPT's slider image was not found; no click sent. Check theme and display scale.");
         }, true);
-        // Keep GPT's popup open, exactly as after a manual slider click.
-        // Verification reads pixels only; do not send Escape or force focus.
+        // Confirm the changed thumb before dismissing the popup and restoring
+        // the composer. Do not inject Escape or force keyboard focus.
         Stopwatch verifyTimer = Stopwatch.StartNew();
         int confirmed = -1;
         do
@@ -320,8 +329,12 @@ internal static class ReasoningSwitch
             if (!popupVisible)
             {
                 // If the app itself dismisses the popup, use the restored composer label.
-                AutomationElement fresh = CodexModelButton(root);
-                confirmed = fresh == null ? -1 : GptEffort(Describe(fresh));
+                confirmed = CurrentButtonEffort(buttonModel, true);
+                if (confirmed < 0)
+                {
+                    buttonModel = CodexModelButton(root);
+                    confirmed = CurrentButtonEffort(buttonModel, true);
+                }
             }
             if (confirmed == target) break;
             Thread.Sleep(20);
@@ -332,59 +345,78 @@ internal static class ReasoningSwitch
     }
     private static void SwitchClaude(AutomationElement root, int direction)
     {
-        AutomationElement buttonModel = ModelButton(root, @"\bOpus\s+5\.5\b");
+        AutomationElement[] buttons = Elements(root, ControlType.Button);
+        AutomationElement buttonModel = ModelButton(buttons, @"\bOpus\s+5\.5\b");
         if (buttonModel == null) throw new InvalidOperationException("Opus 5.5 is not selected, or its model control is unavailable.");
-        trace.AppendLine("model=" + Describe(buttonModel));
-        AutomationElement trigger = ClaudeEffortTrigger(root);
+        trace.AppendLine("model=" + Name(buttonModel));
+        AutomationElement trigger = ClaudeEffortTrigger(buttons);
         if (trigger == null) throw new InvalidOperationException("Claude's effort button is unavailable or ambiguous.");
         int current = ClaudeEffort(Name(trigger));
         trace.AppendLine("effort trigger=" + Name(trigger) + ", current=" + current);
         int target = NextClaude(current, direction);
         if (target == current) { FinishWithInputFocus("Opus 5.5: " + Label(target) + " (unchanged)"); return; }
 
+        System.Windows.Rect triggerBounds = trigger.Current.BoundingRectangle;
+        if (!triggerBounds.IsEmpty)
+            ClaudeImageSlider.ExpectNearButton(targetWindow, new System.Drawing.Rectangle((int)Math.Floor(triggerBounds.X),
+                (int)Math.Floor(triggerBounds.Y), (int)Math.Ceiling(triggerBounds.Width), (int)Math.Ceiling(triggerBounds.Height)));
         object expandPattern;
         bool alreadyOpen = trigger.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out expandPattern) &&
             ((ExpandCollapsePattern)expandPattern).Current.ExpandCollapseState == ExpandCollapseState.Expanded;
         alreadyOpen = alreadyOpen || ClaudeImageSlider.IsPopupVisible(targetWindow);
         if (!alreadyOpen) ClickControlButton(trigger, false);
 
-        System.Drawing.Point click = System.Drawing.Point.Empty;
-        bool located = false;
-        Stopwatch timer = Stopwatch.StartNew();
-        do
-        {
-            EnsureForeground();
-            located = ClaudeImageSlider.TryLocate(targetWindow, current, target, out click);
-            if (located) break;
-            Thread.Sleep(90);
-        } while (timer.ElapsedMilliseconds < 1600);
-        if (!located) throw new InvalidOperationException("Claude's slider image was not found; no click sent. Check theme and display scale.");
-        trace.AppendLine("StrokesPlus image match succeeded; target=" + Label(target));
         ClickPoint(delegate
         {
             System.Drawing.Point freshPoint;
-            if (!ClaudeImageSlider.TryLocate(targetWindow, current, target, out freshPoint))
-                throw new InvalidOperationException("Claude's effort popup is no longer visible; no click sent.");
-            return freshPoint;
+            Stopwatch openTimer = Stopwatch.StartNew();
+            do
+            {
+                EnsureForeground();
+                if (ClaudeImageSlider.TryLocate(targetWindow, current, target, out freshPoint))
+                {
+                    trace.AppendLine("StrokesPlus image match succeeded; target=" + Label(target));
+                    return freshPoint;
+                }
+                Thread.Sleep(25);
+            } while (openTimer.ElapsedMilliseconds < 1600);
+            throw new InvalidOperationException("Claude's slider image was not found; no click sent. Check theme and display scale.");
         }, true);
-        // Leave the popup to the app. Never inject Escape or move focus after selection.
+        // Confirm the change before dismissing the popup and restoring the composer.
 
-        timer.Restart();
+        Stopwatch timer = Stopwatch.StartNew();
         int confirmed = -1;
         do
         {
             EnsureForeground();
             if (!ClaudeImageSlider.TryReadCurrent(targetWindow, out confirmed))
             {
-                AutomationElement fresh = ClaudeEffortTrigger(root);
-                confirmed = fresh == null ? -1 : ClaudeEffort(Name(fresh));
+                confirmed = CurrentButtonEffort(trigger, false);
+                if (confirmed < 0)
+                {
+                    trigger = ClaudeEffortTrigger(root);
+                    confirmed = CurrentButtonEffort(trigger, false);
+                }
             }
             if (confirmed == target) break;
-            Thread.Sleep(90);
+            Thread.Sleep(25);
         } while (timer.ElapsedMilliseconds < 2000);
         trace.AppendLine("confirmed=" + confirmed);
         if (confirmed != target) throw new InvalidOperationException("Claude's slider click did not confirm " + Label(target) + ".");
         FinishWithInputFocus("Opus 5.5: " + Label(target) + " (image verified)");
+    }
+    private static int CurrentButtonEffort(AutomationElement button, bool gpt)
+    {
+        try
+        {
+            if (button == null || button.Current.IsOffscreen || !button.Current.IsEnabled) return -1;
+            // Read the live label, never the snapshot cached before the click.
+            string name = button.Current.Name ?? "";
+            if (gpt)
+                return Regex.IsMatch(name, @"(?:GPT[\s-]*)?6\.1[\s-]+Sol\b", RegexOptions.IgnoreCase) ? GptEffort(name) : -1;
+            return IsEffortTrigger(name) ? ClaudeEffort(name) : -1;
+        }
+        catch { return -1; }
     }
     private static bool IsEffortTrigger(string name)
     {
@@ -392,8 +424,12 @@ internal static class ReasoningSwitch
     }
     private static AutomationElement ClaudeEffortTrigger(AutomationElement root)
     {
+        return ClaudeEffortTrigger(Elements(root, ControlType.Button));
+    }
+    private static AutomationElement ClaudeEffortTrigger(AutomationElement[] buttons)
+    {
         AutomationElement found = null;
-        foreach (AutomationElement button in Elements(root, ControlType.Button))
+        foreach (AutomationElement button in buttons)
         {
             string name = Name(button);
             if (!IsEffortTrigger(name)) continue;
@@ -422,8 +458,10 @@ internal static class ReasoningSwitch
             if (targetRoot == null || !targetRoot.Current.BoundingRectangle.Contains(center))
                 throw new InvalidOperationException("Reasoning button is outside the active window; no click sent.");
             trace.AppendLine("Opening " + (gpt ? "GPT model" : "Claude effort") + " popup with a mouse click.");
-            if (gpt) GptImageSlider.ExpectNearButton(targetWindow, new System.Drawing.Rectangle((int)Math.Floor(bounds.X),
-                (int)Math.Floor(bounds.Y), (int)Math.Ceiling(bounds.Width), (int)Math.Ceiling(bounds.Height)));
+            System.Drawing.Rectangle buttonBounds = new System.Drawing.Rectangle((int)Math.Floor(bounds.X),
+                (int)Math.Floor(bounds.Y), (int)Math.Ceiling(bounds.Width), (int)Math.Ceiling(bounds.Height));
+            if (gpt) GptImageSlider.ExpectNearButton(targetWindow, buttonBounds);
+            else ClaudeImageSlider.ExpectNearButton(targetWindow, buttonBounds);
             return new System.Drawing.Point((int)Math.Round(center.X), (int)Math.Round(center.Y));
         });
     }
@@ -489,7 +527,10 @@ internal static class ReasoningSwitch
     }
     private static bool ChatInputFocused()
     {
-        AutomationElement focused = AutomationElement.FocusedElement;
+        return ChatInputFocused(AutomationElement.FocusedElement);
+    }
+    private static bool ChatInputFocused(AutomationElement focused)
+    {
         if (!IsTextEntry(focused) || chatInputBounds.IsEmpty) return false;
         System.Windows.Rect bounds = focused.Current.BoundingRectangle;
         System.Windows.Rect window = targetRoot.Current.BoundingRectangle;
@@ -508,25 +549,66 @@ internal static class ReasoningSwitch
         if (!known && !labeled && !composerShape) return -1;
         return (known ? 1000 : 0) + (labeled ? 300 : 0) + (composerShape ? 100 : 0) + (bounds.Height >= 40 ? 20 : 0);
     }
+    private static CacheRequest InputMetadataCache()
+    {
+        CacheRequest cache = new CacheRequest();
+        cache.TreeScope = TreeScope.Element;
+        cache.Add(AutomationElement.NameProperty);
+        cache.Add(AutomationElement.AutomationIdProperty);
+        cache.Add(AutomationElement.ClassNameProperty);
+        cache.Add(AutomationElement.BoundingRectangleProperty);
+        cache.Add(AutomationElement.IsOffscreenProperty);
+        cache.Add(AutomationElement.IsEnabledProperty);
+        cache.Add(AutomationElement.ControlTypeProperty);
+        cache.Add(AutomationElement.IsKeyboardFocusableProperty);
+        cache.Add(AutomationElement.ProcessIdProperty);
+        return cache;
+    }
+    private static void SaveChatInput(System.Windows.Rect window, System.Windows.Rect found)
+    {
+        chatInputBounds = found;
+        chatInputWindowBounds = window;
+        uint targetPid; GetWindowThreadProcessId(targetWindow, out targetPid);
+        string[] values = { targetWindow.ToInt64().ToString(), targetPid.ToString(),
+            window.Width.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            window.Height.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            (found.X - window.X).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            (found.Y - window.Y).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            found.Width.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            found.Height.ToString(System.Globalization.CultureInfo.InvariantCulture) };
+        // Only window and rectangle numbers are persisted for already-open popups.
+        File.WriteAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "chat-input-" + app + ".txt"), values);
+    }
     private static void RememberChatInput(AutomationElement root)
     {
         // Read only textbox metadata, never its value or conversation text.
         try
         {
             System.Windows.Rect window = root.Current.BoundingRectangle;
+            try
+            {
+                AutomationElement focused = AutomationElement.FocusedElement;
+                if (focused != null)
+                {
+                    AutomationElement metadata = focused.GetUpdatedCache(InputMetadataCache());
+                    string id = metadata.Cached.AutomationId ?? "", className = metadata.Cached.ClassName ?? "";
+                    if (!metadata.Cached.IsOffscreen && metadata.Cached.IsEnabled && metadata.Cached.IsKeyboardFocusable &&
+                        metadata.Cached.ProcessId == root.Current.ProcessId &&
+                        Regex.IsMatch(id + " " + className, @"prompt-textarea|chat[-_]?input|composer|prosemirror", RegexOptions.IgnoreCase) &&
+                        ChatInputScore(metadata.Cached.Name ?? "", id, className, metadata.Cached.BoundingRectangle, window) >= 0)
+                    {
+                        SaveChatInput(window, metadata.Cached.BoundingRectangle);
+                        trace.AppendLine("Chat input identified from focused composer metadata; full input lookup skipped.");
+                        return;
+                    }
+                }
+            }
+            catch { } // A stale focus or non-composer still uses the original full lookup.
             System.Windows.Rect found = System.Windows.Rect.Empty;
             int bestScore = -1;
             bool ambiguous = false;
             int candidateCount = 0, acceptedCount = 0;
-            CacheRequest cache = new CacheRequest();
-            cache.Add(AutomationElement.NameProperty);
-            cache.Add(AutomationElement.AutomationIdProperty);
-            cache.Add(AutomationElement.ClassNameProperty);
-            cache.Add(AutomationElement.BoundingRectangleProperty);
-            cache.Add(AutomationElement.IsOffscreenProperty);
-            cache.Add(AutomationElement.IsEnabledProperty);
-            cache.Add(AutomationElement.ControlTypeProperty);
-            cache.Add(AutomationElement.IsKeyboardFocusableProperty);
+            CacheRequest cache = InputMetadataCache();
             using (cache.Activate())
                 foreach (AutomationElement input in root.FindAll(TreeScope.Descendants,
                     new OrCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
@@ -557,18 +639,7 @@ internal static class ReasoningSwitch
             trace.AppendLine("Input candidates=" + candidateCount + ", accepted=" + acceptedCount + ", ambiguous=" + ambiguous);
             if (!found.IsEmpty && !ambiguous)
             {
-                chatInputBounds = found;
-                chatInputWindowBounds = window;
-                uint targetPid; GetWindowThreadProcessId(targetWindow, out targetPid);
-                string[] values = { targetWindow.ToInt64().ToString(), targetPid.ToString(),
-                    window.Width.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    window.Height.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    (found.X - window.X).ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    (found.Y - window.Y).ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    found.Width.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    found.Height.ToString(System.Globalization.CultureInfo.InvariantCulture) };
-                // Only window and rectangle numbers are persisted for already-open popups.
-                File.WriteAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "chat-input-" + app + ".txt"), values);
+                SaveChatInput(window, found);
                 trace.AppendLine("Chat input identified from textbox metadata.");
                 return;
             }
@@ -698,8 +769,9 @@ internal static class ReasoningSwitch
     {
         EnsureForeground();
         bool popup = fullSearch ? GptImageSlider.IsPopupVisible(targetWindow) : GptImageSlider.IsPopupVisibleAtLastLocation(targetWindow);
-        bool chat = ChatInputFocused();
-        return new GptFocusState { PopupVisible = popup, ChatFocused = chat, OtherTextFocused = !chat && TextEntryFocused() };
+        AutomationElement focused = AutomationElement.FocusedElement;
+        bool chat = ChatInputFocused(focused);
+        return new GptFocusState { PopupVisible = popup, ChatFocused = chat, OtherTextFocused = !chat && IsTextEntry(focused) };
     }
     private static void FinishGptWithInputFocus(string message)
     {
@@ -821,6 +893,7 @@ internal static class ReasoningSwitch
         {
             string result = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + app + " " + message + Environment.NewLine;
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-result.txt"), result);
+            trace.AppendLine(StrokesImageSearch.Summary);
             string action = result + "build=" + BuildName + "; elapsed=" + operationTimer.ElapsedMilliseconds + " ms" + Environment.NewLine + trace;
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-action.txt"), action);
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-result-" + app + ".txt"), result);
@@ -856,6 +929,7 @@ internal static class ReasoningSwitch
     }
     private static int SelfTest()
     {
+        StrokesImageSearch.SelfTest();
         GptFocusSelfTest();
         // Protect the final click from search fields, off-window edits and popup overlap.
         System.Windows.Rect testWindow = new System.Windows.Rect(0, 0, 1000, 900);

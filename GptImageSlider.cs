@@ -77,11 +77,13 @@ internal static class GptImageSlider
             area = Rectangle.Intersect(area, runtimeSearchArea);
         if (area.IsEmpty) area = new Rectangle(0, 0, width, height);
         origin = new Point(bounds.Left + area.X, bounds.Top + area.Y);
+        System.Diagnostics.Stopwatch captureTimer = System.Diagnostics.Stopwatch.StartNew();
         Bitmap capture = new Bitmap(area.Width, area.Height, PixelFormat.Format24bppRgb);
         try
         {
             using (Graphics graphics = Graphics.FromImage(capture))
                 graphics.CopyFromScreen(origin.X, origin.Y, 0, 0, capture.Size, CopyPixelOperation.SourceCopy);
+            StrokesImageSearch.RecordCapture(area.Width == width && area.Height == height, captureTimer.ElapsedMilliseconds);
             return capture;
         }
         catch { capture.Dispose(); throw; }
