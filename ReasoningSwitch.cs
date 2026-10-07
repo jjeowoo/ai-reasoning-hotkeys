@@ -27,7 +27,9 @@ internal static class ReasoningSwitch
     private static System.Windows.Rect chatInputWindowBounds = System.Windows.Rect.Empty;
     private static StringBuilder trace = new StringBuilder();
     private static Stopwatch operationTimer = Stopwatch.StartNew();
-    private const string BuildName = "18-reduced-search-work";
+    private const string BuildName = "19-strict-claude-model";
+    // Anchored: sidebar session titles may also contain the model name.
+    private const string ClaudeModelPattern = @"^\s*(?:(?:Model|모델)\s*:?\s*(?:Claude\s+)?Opus\s+5\.5\b|(?:Claude\s+)?Opus\s+5\.5\s*$)";
     private static readonly ControlType[] choiceTypes = {
         ControlType.RadioButton, ControlType.MenuItem, ControlType.ListItem,
         ControlType.CheckBox, ControlType.Button
@@ -346,7 +348,7 @@ internal static class ReasoningSwitch
     private static void SwitchClaude(AutomationElement root, int direction)
     {
         AutomationElement[] buttons = Elements(root, ControlType.Button);
-        AutomationElement buttonModel = ModelButton(buttons, @"\bOpus\s+5\.5\b");
+        AutomationElement buttonModel = ModelButton(buttons, ClaudeModelPattern);
         if (buttonModel == null) throw new InvalidOperationException("Opus 5.5 is not selected, or its model control is unavailable.");
         trace.AppendLine("model=" + Name(buttonModel));
         AutomationElement trigger = ClaudeEffortTrigger(buttons);
@@ -876,7 +878,7 @@ internal static class ReasoningSwitch
                     {
                         string name = Name(item);
                         if (!IsEffortChoice(name) && !IsEffortTrigger(name) && !(app == "claude" && ClaudeEffort(name) >= 0 && name.Length < 60) &&
-                            !Regex.IsMatch(name, @"^(?:Model:\s*)?(?:Claude\s+)?Opus\s+5\.5\b|^(?:GPT[\s-]*)?6\.1[\s-]+Sol\b", RegexOptions.IgnoreCase)) continue;
+                            !Regex.IsMatch(name, ClaudeModelPattern + @"|^(?:GPT[\s-]*)?6\.1[\s-]+Sol\b", RegexOptions.IgnoreCase)) continue;
                         if (name.Length > 180) name = name.Substring(0, 180);
                         details.Append(type.ProgrammaticName + " name=" + name + " patterns=");
                         foreach (AutomationPattern pattern in item.GetSupportedPatterns()) details.Append(pattern.ProgrammaticName + " ");
@@ -972,6 +974,10 @@ internal static class ReasoningSwitch
             if (GptEffort(gpt[level]) != level || NextGpt(level, 1) != (level == 4 ? 4 : level + 1) ||
                 NextGpt(level, -1) != (level == 0 ? 0 : level - 1)) return 1;
         if (GptEffort("GPT-6.1 Sol") != -1) return 1;
+        string[] modelNames = { "모델: Opus 5.5", "Model: Opus 5.5", "Opus 5.5", " Opus 5.5" };
+        string[] sessionNames = { "유휴 가이드 Opus 5.5 업그레이드", "가이드 Opus 5.5 업그레이드에 대한 더 많은 옵션", "Opus 5.5 업그레이드에 대한 더 많은 옵션" };
+        foreach (string name in modelNames) if (!Regex.IsMatch(name, ClaudeModelPattern, RegexOptions.IgnoreCase)) return 1;
+        foreach (string name in sessionNames) if (Regex.IsMatch(name, ClaudeModelPattern, RegexOptions.IgnoreCase)) return 1;
         bool rejected = false;
         try { NextClaude(-1, 1); } catch (InvalidOperationException) { rejected = true; }
         return rejected && ClaudeImageSlider.SelfTest() && GptImageSlider.SelfTest() ? 0 : 1;
