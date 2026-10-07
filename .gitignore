@@ -1,0 +1,18 @@
+# Local StrokesPlus settings, diagnostics and cached window positions.
+StrokesPlus.before-*.json
+last-action*.txt
+last-result*.txt
+last-diagnostic*.txt
+chat-input-*.txt
+selftest-error.txt
+
+# Temporary build/replacement files. The tested release executable is tracked.
+*.next.exe
+*.build.exe
+*.replacement-*.tmp
+*.reasoning-move-*.tmp
+*.pdb
+.vs/
+
+# Retired, unused reference screenshot.
+GPT-model-reference.png
