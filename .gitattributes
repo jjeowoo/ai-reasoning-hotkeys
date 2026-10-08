@@ -1,0 +1,6 @@
+# Store text with LF in the repository on every machine, whatever core.autocrlf is set to.
+* text=auto
+
+# Pixel-compared reference images and the tested helper must never be converted.
+*.png binary
+*.exe binary
