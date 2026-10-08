@@ -10,10 +10,13 @@ if($output -ine [IO.Path]::GetFullPath($PSScriptRoot)){
     foreach($name in $references){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $output $name) -Force}
 }
 $sources=@('ReasoningSwitch.cs','GptImageSlider.cs','ClaudeImageSlider.cs','StrokesImageSearch.cs') | ForEach-Object {Join-Path $PSScriptRoot $_}
+# The build name is defined once, in ReasoningSwitch.cs.
+$build=[regex]::Match((Get-Content -LiteralPath $sources[0] -Raw),'BuildName\s*=\s*"([^"]+)"').Groups[1].Value
+if(-not $build){throw 'BuildName was not found in ReasoningSwitch.cs.'}
 $next=Join-Path $output 'ReasoningSwitch.build.exe'
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ ('/out:'+$next) ('/reference:'+(Join-Path $wpf 'UIAutomationClient.dll')) ('/reference:'+(Join-Path $wpf 'UIAutomationTypes.dll')) ('/reference:'+(Join-Path $wpf 'WindowsBase.dll')) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $sources
 if($LASTEXITCODE -ne 0){throw 'Compilation failed; the existing helper was not replaced.'}
 $test=Start-Process -FilePath $next -ArgumentList '--selftest' -WindowStyle Hidden -PassThru -Wait
 if($test.ExitCode -ne 0){throw 'Self-test failed; see selftest-error.txt. The existing helper was not replaced.'}
 Move-Item -LiteralPath $next -Destination (Join-Path $output 'ReasoningSwitch.exe') -Force
-[pscustomobject]@{Build='19-strict-claude-model';SelfTest='passed';Executable=(Join-Path $output 'ReasoningSwitch.exe')}
+[pscustomobject]@{Build=$build;SelfTest='passed';Executable=(Join-Path $output 'ReasoningSwitch.exe')}
