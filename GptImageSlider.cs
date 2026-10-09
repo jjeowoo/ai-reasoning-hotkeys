@@ -11,6 +11,8 @@ internal static class GptImageSlider
     private struct NativeRect { internal int Left, Top, Right, Bottom; }
     // Model subtitle and its arrow stay unchanged when effort changes.
     private static readonly Rectangle referenceAnchor = new Rectangle(94, 31, 74, 13);
+    // Conversation text behind the popup shifted its pixels by up to 5 levels when measured.
+    private const int AnchorTolerance = 16;
     private static Bitmap runtimeNeedle;
     private static Rectangle runtimeSearchArea = Rectangle.Empty;
     internal static Rectangle PopupBounds { get; private set; }
@@ -98,7 +100,8 @@ internal static class GptImageSlider
             Bitmap candidate = Capture(hwnd, firstIsFull || attempt == 1, out origin, out windowOrigin);
             try
             {
-                object match = StrokesImageSearch.Match(RuntimeNeedle(), candidate);
+                object match = StrokesImageSearch.Match(RuntimeNeedle(), candidate) ??
+                    StrokesImageSearch.TolerantMatch(RuntimeNeedle(), candidate, AnchorTolerance);
                 if (match != null)
                 {
                     anchor = (Point)match;
@@ -191,6 +194,21 @@ internal static class GptImageSlider
             int[] centers = { 92, 143, 194, 245, 296 };
             if (!ThumbAt(canvas, new Point(245, 113), 3) || ReadThumb(canvas, anchor) != 3)
                 throw new InvalidOperationException("GPT image selftest: attached Extra High thumb not recognized.");
+            // Text behind the translucent popup darkens it by a few levels, most at the top.
+            using (Bitmap dimmed = canvas.Clone(new Rectangle(Point.Empty, canvas.Size), PixelFormat.Format24bppRgb))
+            {
+                for (int y = 43; y < 43 + 62; y++)
+                    for (int x = 67; x < 67 + 253; x++)
+                    {
+                        Color color = dimmed.GetPixel(x, y);
+                        int shift = y < 43 + 20 ? 5 : y < 43 + 40 ? 3 : 1;
+                        dimmed.SetPixel(x, y, Color.FromArgb(Math.Max(0, color.R - shift), Math.Max(0, color.G - shift), Math.Max(0, color.B - shift)));
+                    }
+                object dimmedMatch = StrokesImageSearch.TolerantMatch(needle, dimmed, AnchorTolerance);
+                if (StrokesImageSearch.Match(needle, dimmed) != null || dimmedMatch == null ||
+                    (Point)dimmedMatch != new Point(161, 74) || ReadThumb(dimmed, (Point)dimmedMatch) != 3)
+                    throw new InvalidOperationException("GPT image selftest: dimmed popup not recognized within tolerance.");
+            }
             // Real before/after screenshots: only the open popup should match the anchor.
             using (Image high = Image.FromFile(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "GPT-effort-high-reference.png")))
             using (Bitmap highCanvas = new Bitmap(high.Width, high.Height, PixelFormat.Format24bppRgb))
@@ -204,7 +222,8 @@ internal static class GptImageSlider
             using (Bitmap closedCanvas = new Bitmap(closed.Width, closed.Height, PixelFormat.Format24bppRgb))
             {
                 using (Graphics graphics = Graphics.FromImage(closedCanvas)) graphics.DrawImageUnscaled(closed, 0, 0);
-                if (StrokesImageSearch.Match(needle, closedCanvas) != null)
+                if (StrokesImageSearch.Match(needle, closedCanvas) != null ||
+                    StrokesImageSearch.TolerantMatch(needle, closedCanvas, AnchorTolerance) != null)
                     throw new InvalidOperationException("GPT image selftest: closed composer misidentified as a popup.");
             }
             for (int stop = 0; stop < 5; stop++)
@@ -246,7 +265,8 @@ internal static class GptImageSlider
             if (ReadThumb(canvas, anchor) != -1)
                 throw new InvalidOperationException("GPT image selftest: ambiguous thumbs accepted.");
             using (Graphics graphics = Graphics.FromImage(canvas)) graphics.Clear(Color.Magenta);
-            return StrokesImageSearch.Match(needle, canvas) == null;
+            return StrokesImageSearch.Match(needle, canvas) == null &&
+                StrokesImageSearch.TolerantMatch(needle, canvas, AnchorTolerance) == null;
         }
     }
 }

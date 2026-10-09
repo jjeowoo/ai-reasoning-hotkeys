@@ -27,11 +27,12 @@ internal static class ReasoningSwitch
     private static System.Windows.Rect chatInputWindowBounds = System.Windows.Rect.Empty;
     private static StringBuilder trace = new StringBuilder();
     private static Stopwatch operationTimer = Stopwatch.StartNew();
-    private const string BuildName = "20-wait-for-claude-controls";
+    private const string BuildName = "22-translucent-gpt-popup";
     // Anchored: sidebar session titles may also contain the model name.
     private const string ClaudeModelPattern = @"^\s*(?:(?:Model|모델)\s*:?\s*(?:Claude\s+)?Opus\s+5\.5\b|(?:Claude\s+)?Opus\s+5\.5\s*$)";
+    // Not ListItem: Claude's Chat tab exposes conversation text as list items.
     private static readonly ControlType[] choiceTypes = {
-        ControlType.RadioButton, ControlType.MenuItem, ControlType.ListItem,
+        ControlType.RadioButton, ControlType.MenuItem,
         ControlType.CheckBox, ControlType.Button
     };
 
@@ -243,6 +244,11 @@ internal static class ReasoningSwitch
         }
         return found;
     }
+    private static bool IsSupportedGptMode(string name)
+    {
+        // The mode switch reads "..., current mode: Codex" or "...: ChatGPT"; both show the same slider.
+        return Regex.IsMatch(name, @"(mode|모드).*\b(Codex|ChatGPT)\b", RegexOptions.IgnoreCase);
+    }
     private static void SwitchCodex(AutomationElement root, int direction)
     {
         EnsureForeground();
@@ -254,12 +260,12 @@ internal static class ReasoningSwitch
         // Its exact GPT-6.1 Sol image identifies the intended model directly.
         if (!wasOpen)
         {
-            bool codexMode = false;
+            bool supportedMode = false;
             AutomationElement[] buttons = Elements(root, ControlType.Button);
             foreach (AutomationElement button in buttons)
-                if (Regex.IsMatch(Name(button), @"(mode|모드).*Codex", RegexOptions.IgnoreCase)) codexMode = true;
-            trace.AppendLine("Codex mode=" + codexMode);
-            if (!codexMode) throw new InvalidOperationException("The active ChatGPT window must be in Codex mode.");
+                if (IsSupportedGptMode(Name(button))) supportedMode = true;
+            trace.AppendLine("ChatGPT or Codex mode=" + supportedMode);
+            if (!supportedMode) throw new InvalidOperationException("The active ChatGPT window must be in ChatGPT or Codex mode.");
             buttonModel = CodexModelButton(buttons);
         }
         Stopwatch readTimer = Stopwatch.StartNew();
@@ -374,8 +380,13 @@ internal static class ReasoningSwitch
         if (lookups > 1) trace.AppendLine("Claude controls lookups=" + lookups + ", waited=" + treeTimer.ElapsedMilliseconds + " ms.");
         if (buttonModel == null) throw new InvalidOperationException("Opus 5.5 is not selected, or its model control is unavailable.");
         trace.AppendLine("model=" + Name(buttonModel));
-        AutomationElement trigger = ClaudeEffortTrigger(buttons);
-        if (trigger == null) throw new InvalidOperationException("Claude's effort button is unavailable or ambiguous.");
+        int triggers = 0;
+        AutomationElement trigger = null;
+        foreach (AutomationElement button in buttons)
+            if (IsEffortTrigger(Name(button))) { triggers++; trigger = button; }
+        // The Chat tab has no effort button; its model button opens a menu instead.
+        if (triggers == 0 && !ClaudeCodeTabSelected(root)) { SwitchClaudeChat(root, buttonModel, direction); return; }
+        if (triggers != 1) throw new InvalidOperationException("Claude's effort button is unavailable or ambiguous.");
         int current = ClaudeEffort(Name(trigger));
         trace.AppendLine("effort trigger=" + Name(trigger) + ", current=" + current);
         int target = NextClaude(current, direction);
@@ -429,6 +440,228 @@ internal static class ReasoningSwitch
         trace.AppendLine("confirmed=" + confirmed);
         if (confirmed != target) throw new InvalidOperationException("Claude's slider click did not confirm " + Label(target) + ".");
         FinishWithInputFocus("Opus 5.5: " + Label(target) + " (image verified)");
+    }
+    private sealed class ClaudeMenuItem
+    {
+        internal AutomationElement Element;
+        internal string Name;
+        internal System.Windows.Rect Menu;
+    }
+    private static readonly Condition claudeMenuItemCondition = new OrCondition(
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.RadioButton),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.CheckBox),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+    private static bool claudeMenuFlow;
+    private static System.Drawing.Rectangle claudeMenuBounds = System.Drawing.Rectangle.Empty;
+    private static bool ClaudeCodeTabSelected(AutomationElement root)
+    {
+        foreach (AutomationElement tab in Elements(root, ControlType.RadioButton))
+        {
+            object pattern;
+            try
+            {
+                if (Regex.IsMatch(Name(tab), @"^\s*Code\b", RegexOptions.IgnoreCase) &&
+                    tab.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern) &&
+                    ((SelectionItemPattern)pattern).Current.IsSelected) return true;
+            }
+            catch { }
+        }
+        return false;
+    }
+    // Low, Medium, High, Extra, Max: the Chat tab has no Ultracode.
+    private static int ChatEffortOption(string name)
+    {
+        string[] patterns = {
+            @"^\s*(low\b|낮음)", @"^\s*(medium\b|중간|보통)", @"^\s*(high\b|높음)",
+            @"^\s*(extra\b|xhigh\b|엑스트라|매우\s*높음|아주\s*높음)", @"^\s*(max\b|maximum\b|최대)" };
+        for (int level = 0; level < patterns.Length; level++)
+            if (Regex.IsMatch(name, patterns[level], RegexOptions.IgnoreCase)) return level;
+        return -1;
+    }
+    private static int NextClaudeChat(int current, int direction)
+    {
+        if (current < 0 || current > 4) throw new InvalidOperationException("Claude's Chat effort is not one of Low, Medium, High, Extra, or Max.");
+        return Math.Max(0, Math.Min(4, current + direction));
+    }
+    // Only items inside menu popups are read, so conversation text is never matched.
+    private static List<ClaudeMenuItem> ClaudeMenuItems(AutomationElement root)
+    {
+        List<ClaudeMenuItem> items = new List<ClaudeMenuItem>();
+        CacheRequest cache = new CacheRequest();
+        cache.Add(AutomationElement.NameProperty);
+        cache.Add(AutomationElement.IsOffscreenProperty);
+        cache.Add(AutomationElement.IsEnabledProperty);
+        cache.Add(AutomationElement.BoundingRectangleProperty);
+        cache.TreeScope = TreeScope.Element;
+        using (cache.Activate())
+            foreach (AutomationElement menu in root.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu)))
+                try
+                {
+                    if (menu.Cached.IsOffscreen) continue;
+                    foreach (AutomationElement item in menu.FindAll(TreeScope.Descendants, claudeMenuItemCondition))
+                        if (!item.Cached.IsOffscreen && item.Cached.IsEnabled)
+                            items.Add(new ClaudeMenuItem { Element = item, Name = item.Cached.Name ?? "", Menu = menu.Cached.BoundingRectangle });
+                }
+                catch { }
+        return items;
+    }
+    private static ClaudeMenuItem ClaudeEffortRow(List<ClaudeMenuItem> items)
+    {
+        foreach (ClaudeMenuItem item in items) if (IsEffortTrigger(item.Name)) return item;
+        return null;
+    }
+    private static ClaudeMenuItem ClaudeEffortOption(List<ClaudeMenuItem> items, int level)
+    {
+        foreach (ClaudeMenuItem item in items) if (ChatEffortOption(item.Name) == level) return item;
+        return null;
+    }
+    private static bool IsChosen(AutomationElement item)
+    {
+        object pattern;
+        try
+        {
+            if (item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern) &&
+                ((SelectionItemPattern)pattern).Current.IsSelected) return true;
+            if (item.TryGetCurrentPattern(TogglePattern.Pattern, out pattern) &&
+                ((TogglePattern)pattern).Current.ToggleState == ToggleState.On) return true;
+        }
+        catch { }
+        return false;
+    }
+    private static int ChosenChatEffort(List<ClaudeMenuItem> items)
+    {
+        int found = -1;
+        foreach (ClaudeMenuItem item in items)
+        {
+            int level = ChatEffortOption(item.Name);
+            if (level < 0 || level == found || !IsChosen(item.Element)) continue;
+            if (found >= 0) return -1;
+            found = level;
+        }
+        return found;
+    }
+    private static string MenuNames(List<ClaudeMenuItem> items)
+    {
+        // Menu labels only, shortened; used when a step cannot find its item.
+        StringBuilder names = new StringBuilder();
+        for (int i = 0; i < items.Count && i < 20; i++)
+            names.Append(items[i].Name.Length > 24 ? items[i].Name.Substring(0, 24) : items[i].Name).Append(" | ");
+        return names.ToString();
+    }
+    private static System.Drawing.Point MenuClickPoint(ClaudeMenuItem item)
+    {
+        EnsureForeground();
+        System.Windows.Rect bounds = item.Element.Current.BoundingRectangle;
+        if (bounds.IsEmpty || bounds.Width <= 0 || bounds.Height <= 0 ||
+            Double.IsNaN(bounds.X) || Double.IsNaN(bounds.Y) || Double.IsInfinity(bounds.X) || Double.IsInfinity(bounds.Y))
+            throw new InvalidOperationException("Claude's menu item has no valid position; no click sent.");
+        System.Windows.Point center = new System.Windows.Point(bounds.X + bounds.Width / 2, bounds.Y + bounds.Height / 2);
+        if (targetRoot == null || !targetRoot.Current.BoundingRectangle.Contains(center))
+            throw new InvalidOperationException("Claude's menu item is outside the active window; no click sent.");
+        return new System.Drawing.Point((int)Math.Round(center.X), (int)Math.Round(center.Y));
+    }
+    private static void AddMenuBounds(ClaudeMenuItem item)
+    {
+        if (item == null || item.Menu.IsEmpty) return;
+        System.Drawing.Rectangle menu = new System.Drawing.Rectangle((int)Math.Floor(item.Menu.X), (int)Math.Floor(item.Menu.Y),
+            (int)Math.Ceiling(item.Menu.Width), (int)Math.Ceiling(item.Menu.Height));
+        claudeMenuBounds = claudeMenuBounds.IsEmpty ? menu : System.Drawing.Rectangle.Union(claudeMenuBounds, menu);
+    }
+    private static void SwitchClaudeChat(AutomationElement root, AutomationElement buttonModel, int direction)
+    {
+        claudeMenuFlow = true;
+        int current = ClaudeEffort(Name(buttonModel));
+        trace.AppendLine("Chat tab; effort on model button=" + current);
+        if (current >= 0 && NextClaudeChat(current, direction) == current)
+        {
+            FinishWithInputFocus("Opus 5.5: " + Label(current) + " (unchanged)");
+            return;
+        }
+        object expandPattern;
+        bool alreadyOpen = buttonModel.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out expandPattern) &&
+            ((ExpandCollapsePattern)expandPattern).Current.ExpandCollapseState == ExpandCollapseState.Expanded;
+        System.Drawing.Point startCursor, lastPoint = System.Drawing.Point.Empty, now;
+        bool haveCursor = GetCursorPos(out startCursor);
+        if (!alreadyOpen) ClickControlButton(buttonModel, false);
+        int target;
+        try
+        {
+            List<ClaudeMenuItem> items = null;
+            ClaudeMenuItem row = null, option = null;
+            Stopwatch timer = Stopwatch.StartNew();
+            do
+            {
+                EnsureForeground();
+                items = ClaudeMenuItems(root);
+                row = ClaudeEffortRow(items);
+                if (row != null) break;
+                Thread.Sleep(25);
+            } while (timer.ElapsedMilliseconds < 1600);
+            if (row == null)
+            {
+                trace.AppendLine("menu items=" + MenuNames(items));
+                throw new InvalidOperationException("Claude's effort row was not found in the model menu; no change made.");
+            }
+            trace.AppendLine("effort row=" + row.Name);
+            AddMenuBounds(row);
+            if (current < 0) current = ClaudeEffort(row.Name);
+            // Leave the cursor on the row so the submenu it opens is not dismissed by hover logic.
+            if (ClaudeEffortOption(items, 0) == null && ClaudeEffortOption(items, 4) == null)
+                ClickPoint(delegate { return lastPoint = MenuClickPoint(row); }, true, false);
+            timer.Restart();
+            do
+            {
+                EnsureForeground();
+                items = ClaudeMenuItems(root);
+                if (current < 0) current = ChosenChatEffort(items);
+                if (current >= 0 && current <= 4) option = ClaudeEffortOption(items, NextClaudeChat(current, direction));
+                if (option != null) break;
+                Thread.Sleep(25);
+            } while (timer.ElapsedMilliseconds < 1600);
+            if (option == null)
+            {
+                trace.AppendLine("current=" + current + "; menu items=" + MenuNames(items));
+                throw new InvalidOperationException("Claude's effort options were not found in the menu; no change made.");
+            }
+            target = NextClaudeChat(current, direction);
+            trace.AppendLine("current=" + current + ", target option=" + option.Name);
+            AddMenuBounds(option);
+            if (target != current)
+            {
+                ClickPoint(delegate { return lastPoint = MenuClickPoint(option); }, true, false);
+                // Confirm from the menu's own state, or from the model button once the menu has closed.
+                int confirmed = -1;
+                timer.Restart();
+                do
+                {
+                    EnsureForeground();
+                    items = ClaudeMenuItems(root);
+                    confirmed = ChosenChatEffort(items);
+                    row = ClaudeEffortRow(items);
+                    if (confirmed != target && row != null && ClaudeEffort(row.Name) >= 0) confirmed = ClaudeEffort(row.Name);
+                    if (confirmed != target)
+                    {
+                        string live = "";
+                        try { live = buttonModel.Current.Name ?? ""; } catch { }
+                        if (Regex.IsMatch(live, ClaudeModelPattern, RegexOptions.IgnoreCase) && ClaudeEffort(live) >= 0)
+                            confirmed = ClaudeEffort(live);
+                    }
+                    if (confirmed == target) break;
+                    Thread.Sleep(25);
+                } while (timer.ElapsedMilliseconds < 2000);
+                trace.AppendLine("confirmed=" + confirmed);
+                if (confirmed != target) throw new InvalidOperationException("Claude's menu click did not confirm " + Label(target) + ".");
+            }
+        }
+        finally
+        {
+            if (haveCursor && !lastPoint.IsEmpty && GetForegroundWindow() == targetWindow && GetCursorPos(out now) && now == lastPoint)
+                SetCursorPos(startCursor.X, startCursor.Y);
+        }
+        FinishWithInputFocus("Opus 5.5: " + Label(target) + (target == current ? " (unchanged)" : " (menu verified)"));
     }
     private static int CurrentButtonEffort(AutomationElement button, bool gpt)
     {
@@ -494,7 +727,7 @@ internal static class ReasoningSwitch
     {
         ClickPoint(delegate { return point; });
     }
-    private static void ClickPoint(Func<System.Drawing.Point> locate, bool protectTextEntry = false)
+    private static void ClickPoint(Func<System.Drawing.Point> locate, bool protectTextEntry = false, bool restoreCursor = true)
     {
         System.Drawing.Point point;
         Stopwatch locateTimer = Stopwatch.StartNew();
@@ -516,7 +749,7 @@ internal static class ReasoningSwitch
                 throw new InvalidOperationException("Release Ctrl, Alt and the arrow key, then press the hotkey again.");
         } while (true);
         System.Drawing.Point previous, after;
-        bool restore = GetCursorPos(out previous);
+        bool restore = GetCursorPos(out previous) && restoreCursor;
         if (!SetCursorPos(point.X, point.Y)) throw new InvalidOperationException("Cannot position the cursor on the target control.");
         try
         {
@@ -722,30 +955,38 @@ internal static class ReasoningSwitch
                 if (!chatInputBounds.IsEmpty && Math.Abs(window.Width - chatInputWindowBounds.Width) <= 1 &&
                     Math.Abs(window.Height - chatInputWindowBounds.Height) <= 1)
                 {
-                    ClickPoint(delegate
+                    // The Chat tab's menu can swallow the click that dismisses it,
+                    // so that flow gets one verified retry; the slider popup gets none.
+                    for (int attempt = 1; attempt <= (claudeMenuFlow ? 2 : 1) && !focused; attempt++)
                     {
-                        if (TextEntryFocused()) throw new OperationCanceledException("Input already focused; no extra click sent.");
-                        System.Windows.Rect currentWindow = targetRoot.Current.BoundingRectangle;
-                        if (Math.Abs(currentWindow.Width - window.Width) > 1 || Math.Abs(currentWindow.Height - window.Height) > 1)
-                            throw new OperationCanceledException("Window resized before input focus; no click sent.");
-                        System.Windows.Rect input = chatInputBounds;
-                        input.Offset(currentWindow.X - chatInputWindowBounds.X, currentWindow.Y - chatInputWindowBounds.Y);
-                        System.Drawing.Rectangle popup = app == "chatgpt" ? GptImageSlider.PopupBounds : ClaudeImageSlider.PopupBounds;
-                        popup.Inflate(3, 3);
-                        System.Drawing.Point point;
-                        if (!TryInputClickPoint(input, popup, out point))
-                            throw new OperationCanceledException("Chat input is covered by the reasoning popup; no click sent.");
-                        return point;
-                    }, true);
-                    trace.AppendLine("Chat input clicked once at " + operationTimer.ElapsedMilliseconds + " ms; no further input will be sent.");
-                    Stopwatch focusTimer = Stopwatch.StartNew();
-                    do
-                    {
-                        EnsureForeground();
-                        focused = ChatInputFocused();
-                        if (focused) break;
-                        Thread.Sleep(10);
-                    } while (focusTimer.ElapsedMilliseconds < 300);
+                        ClickPoint(delegate
+                        {
+                            if (TextEntryFocused()) throw new OperationCanceledException("Input already focused; no extra click sent.");
+                            System.Windows.Rect currentWindow = targetRoot.Current.BoundingRectangle;
+                            if (Math.Abs(currentWindow.Width - window.Width) > 1 || Math.Abs(currentWindow.Height - window.Height) > 1)
+                                throw new OperationCanceledException("Window resized before input focus; no click sent.");
+                            System.Windows.Rect input = chatInputBounds;
+                            input.Offset(currentWindow.X - chatInputWindowBounds.X, currentWindow.Y - chatInputWindowBounds.Y);
+                            System.Drawing.Rectangle popup = app == "chatgpt" ? GptImageSlider.PopupBounds :
+                                claudeMenuFlow ? claudeMenuBounds : ClaudeImageSlider.PopupBounds;
+                            popup.Inflate(3, 3);
+                            System.Drawing.Point point;
+                            if (!TryInputClickPoint(input, popup, out point))
+                                throw new OperationCanceledException("Chat input is covered by the reasoning popup; no click sent.");
+                            return point;
+                        }, true);
+                        trace.AppendLine(attempt == 1
+                            ? "Chat input clicked once at " + operationTimer.ElapsedMilliseconds + " ms" + (claudeMenuFlow ? "." : "; no further input will be sent.")
+                            : "Chat input clicked again at " + operationTimer.ElapsedMilliseconds + " ms; no further input will be sent.");
+                        Stopwatch focusTimer = Stopwatch.StartNew();
+                        do
+                        {
+                            EnsureForeground();
+                            focused = ChatInputFocused();
+                            if (focused) break;
+                            Thread.Sleep(10);
+                        } while (focusTimer.ElapsedMilliseconds < 300);
+                    }
                 }
             }
         }
@@ -1004,6 +1245,18 @@ internal static class ReasoningSwitch
         // Another model's control means the tree is ready; frame buttons alone mean it is not.
         foreach (string name in new[] { "모델: Opus 5.5", "모델: Sonnet 5.5", "Model: Haiku 5.5", " model : Opus 5.5" }) if (!IsModelControl(name)) return 1;
         foreach (string name in new[] { "최소화", "최대화", "닫기", "노력: 높음", "Opus 5.5", sessionNames[0] }) if (IsModelControl(name)) return 1;
+        string[] chatOptions = { "낮음", "중간 추천", "높음", "엑스트라", "최대 4× 이상 사용량" };
+        string[] chatOptionsEnglish = { "Low", "Medium Recommended", "High", "Extra", "Max 4x+ usage" };
+        for (int level = 0; level < 5; level++)
+            if (ChatEffortOption(chatOptions[level]) != level || ChatEffortOption(chatOptionsEnglish[level]) != level ||
+                NextClaudeChat(level, 1) != (level == 4 ? 4 : level + 1) || NextClaudeChat(level, -1) != (level == 0 ? 0 : level - 1)) return 1;
+        foreach (string name in new[] { "노력 중간", "Opus 5.5 복잡한 작업과 일상 업무를 위해", "더 많은 모델", "파일", "최소화", "Lower", "Maxwell" })
+            if (ChatEffortOption(name) != -1) return 1;
+        if (!IsEffortTrigger("노력 중간") || ClaudeEffort("노력 중간") != 1 || ClaudeEffort("모델: Opus 5.5 엑스트라") != 3 ||
+            ClaudeEffort("모델: Opus 5.5") != -1) return 1;
+        if (!IsSupportedGptMode("모드 전환, 현재 모드: Codex") || !IsSupportedGptMode("모드 전환, 현재 모드: ChatGPT") ||
+            !IsSupportedGptMode("Switch mode, current mode: ChatGPT") || IsSupportedGptMode("모드 전환, 현재 모드: 이미지") ||
+            IsSupportedGptMode("ChatGPT")) return 1;
         bool rejected = false;
         try { NextClaude(-1, 1); } catch (InvalidOperationException) { rejected = true; }
         return rejected && ClaudeImageSlider.SelfTest() && GptImageSlider.SelfTest() ? 0 : 1;

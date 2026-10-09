@@ -4,18 +4,20 @@ using System.Diagnostics;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 internal static class StrokesImageSearch
 {
     private static MethodInfo matcher;
     private static Bitmap preparedNeedle, searchSeed;
     private static Point seedOffset;
-    private static int matchCount, wholeCaptures, localCaptures;
+    private static int matchCount, wholeCaptures, localCaptures, tolerantHits, closestDifference = -1;
     private static long matchMilliseconds, captureMilliseconds;
     internal static string Summary
     {
         get { return "Image matches=" + matchCount + ", time=" + matchMilliseconds +
-            " ms; captures whole=" + wholeCaptures + ", local=" + localCaptures + ", time=" + captureMilliseconds + " ms."; }
+            " ms; captures whole=" + wholeCaptures + ", local=" + localCaptures + ", time=" + captureMilliseconds + " ms." +
+            (closestDifference < 0 ? "" : " Tolerant anchor hits=" + tolerantHits + ", closest difference=" + closestDifference + "."); }
     }
     internal static void RecordCapture(bool fullWindow, long milliseconds)
     {
@@ -90,6 +92,86 @@ internal static class StrokesImageSearch
             if (ExactMatchAt(needle, haystack, candidate)) return candidate;
             // An identical text fragment elsewhere must not hide the real popup.
             return RawMatch(needle, haystack);
+        }
+        finally { matchMilliseconds += timer.ElapsedMilliseconds; }
+    }
+
+    private static byte[] Pixels(Bitmap bitmap, out int stride)
+    {
+        BitmapData data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+            ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        try
+        {
+            stride = data.Stride;
+            byte[] bytes = new byte[stride * bitmap.Height];
+            Marshal.Copy(data.Scan0, bytes, 0, bytes.Length);
+            return bytes;
+        }
+        finally { bitmap.UnlockBits(data); }
+    }
+
+    // The GPT popup is slightly translucent and blurs whatever lies behind it, so
+    // its pixels shift by a few levels with the conversation. Every pixel must
+    // still agree within the tolerance; the closest position wins.
+    internal static object TolerantMatch(Bitmap needle, Bitmap haystack, int tolerance)
+    {
+        Stopwatch timer = Stopwatch.StartNew();
+        try
+        {
+            // Bitmap.Width and Height are native calls; read them once, not per position.
+            int width = needle.Width, height = needle.Height, largeWidth = haystack.Width, largeHeight = haystack.Height;
+            if (width > largeWidth || height > largeHeight) return null;
+            int needleStride, stride;
+            byte[] small = Pixels(needle, out needleStride), large = Pixels(haystack, out stride);
+            // Probe the darkest text pixel of each sixth of the needle first:
+            // nearly every position fails on one of them.
+            const int strips = 6;
+            int[] probeNeedle = new int[strips], probeOffset = new int[strips];
+            for (int strip = 0; strip < strips; strip++)
+            {
+                int darkest = int.MaxValue;
+                for (int y = 0; y < height; y++)
+                    for (int x = strip * width / strips; x < (strip + 1) * width / strips; x++)
+                    {
+                        int i = y * needleStride + x * 3, sum = small[i] + small[i + 1] + small[i + 2];
+                        if (sum >= darkest) continue;
+                        darkest = sum; probeNeedle[strip] = i; probeOffset[strip] = y * stride + x * 3;
+                    }
+            }
+            // Positions beyond this are not worth reporting as "closest" either.
+            const int examined = 48;
+            int best = examined + 1;
+            Point found = Point.Empty;
+            for (int top = 0; top + height <= largeHeight; top++)
+                for (int left = 0; left + width <= largeWidth; left++)
+                {
+                    int origin = top * stride + left * 3;
+                    bool rejected = false;
+                    for (int strip = 0; strip < strips && !rejected; strip++)
+                    {
+                        int at = origin + probeOffset[strip], i = probeNeedle[strip];
+                        rejected = Math.Abs(large[at] - small[i]) >= best || Math.Abs(large[at + 1] - small[i + 1]) >= best ||
+                            Math.Abs(large[at + 2] - small[i + 2]) >= best;
+                    }
+                    if (rejected) continue;
+                    int worst = 0;
+                    for (int y = 0; y < height && worst < best; y++)
+                    {
+                        int a = y * needleStride, b = (top + y) * stride + left * 3;
+                        for (int x = 0; x < width * 3; x++)
+                        {
+                            int difference = Math.Abs(small[a + x] - large[b + x]);
+                            if (difference <= worst) continue;
+                            worst = difference;
+                            if (worst >= best) break;
+                        }
+                    }
+                    if (worst < best) { best = worst; found = new Point(left, top); }
+                }
+            if (best <= examined && (closestDifference < 0 || best < closestDifference)) closestDifference = best;
+            if (best > tolerance) return null;
+            tolerantHits++;
+            return found;
         }
         finally { matchMilliseconds += timer.ElapsedMilliseconds; }
     }
