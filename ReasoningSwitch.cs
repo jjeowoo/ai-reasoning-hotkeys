@@ -27,7 +27,7 @@ internal static class ReasoningSwitch
     private static System.Windows.Rect chatInputWindowBounds = System.Windows.Rect.Empty;
     private static StringBuilder trace = new StringBuilder();
     private static Stopwatch operationTimer = Stopwatch.StartNew();
-    private const string BuildName = "19-strict-claude-model";
+    private const string BuildName = "20-wait-for-claude-controls";
     // Anchored: sidebar session titles may also contain the model name.
     private const string ClaudeModelPattern = @"^\s*(?:(?:Model|모델)\s*:?\s*(?:Claude\s+)?Opus\s+5\.5\b|(?:Claude\s+)?Opus\s+5\.5\s*$)";
     private static readonly ControlType[] choiceTypes = {
@@ -345,10 +345,33 @@ internal static class ReasoningSwitch
         if (confirmed != target) throw new InvalidOperationException("GPT's slider click did not confirm " + GptLabel(target) + ".");
         FinishWithInputFocus("GPT 6.1 Sol: " + GptLabel(target) + " (image verified)");
     }
+    private static bool IsModelControl(string name)
+    {
+        return Regex.IsMatch(name, @"^\s*(?:Model|모델)\s*:", RegexOptions.IgnoreCase);
+    }
+    private static bool HasModelControl(AutomationElement[] buttons)
+    {
+        foreach (AutomationElement button in buttons) if (IsModelControl(Name(button))) return true;
+        return false;
+    }
     private static void SwitchClaude(AutomationElement root, int direction)
     {
-        AutomationElement[] buttons = Elements(root, ControlType.Button);
-        AutomationElement buttonModel = ModelButton(buttons, ClaudeModelPattern);
+        // Chromium builds its accessibility tree on request, so the first lookup
+        // can return only the window frame. Wait for the composer's model control.
+        AutomationElement[] buttons;
+        AutomationElement buttonModel;
+        Stopwatch treeTimer = Stopwatch.StartNew();
+        int lookups = 0;
+        do
+        {
+            EnsureForeground();
+            buttons = Elements(root, ControlType.Button);
+            lookups++;
+            buttonModel = ModelButton(buttons, ClaudeModelPattern);
+            if (buttonModel != null || HasModelControl(buttons)) break;
+            Thread.Sleep(50);
+        } while (treeTimer.ElapsedMilliseconds < 1500);
+        if (lookups > 1) trace.AppendLine("Claude controls lookups=" + lookups + ", waited=" + treeTimer.ElapsedMilliseconds + " ms.");
         if (buttonModel == null) throw new InvalidOperationException("Opus 5.5 is not selected, or its model control is unavailable.");
         trace.AppendLine("model=" + Name(buttonModel));
         AutomationElement trigger = ClaudeEffortTrigger(buttons);
@@ -978,6 +1001,9 @@ internal static class ReasoningSwitch
         string[] sessionNames = { "유휴 가이드 Opus 5.5 업그레이드", "가이드 Opus 5.5 업그레이드에 대한 더 많은 옵션", "Opus 5.5 업그레이드에 대한 더 많은 옵션" };
         foreach (string name in modelNames) if (!Regex.IsMatch(name, ClaudeModelPattern, RegexOptions.IgnoreCase)) return 1;
         foreach (string name in sessionNames) if (Regex.IsMatch(name, ClaudeModelPattern, RegexOptions.IgnoreCase)) return 1;
+        // Another model's control means the tree is ready; frame buttons alone mean it is not.
+        foreach (string name in new[] { "모델: Opus 5.5", "모델: Sonnet 5.5", "Model: Haiku 5.5", " model : Opus 5.5" }) if (!IsModelControl(name)) return 1;
+        foreach (string name in new[] { "최소화", "최대화", "닫기", "노력: 높음", "Opus 5.5", sessionNames[0] }) if (IsModelControl(name)) return 1;
         bool rejected = false;
         try { NextClaude(-1, 1); } catch (InvalidOperationException) { rejected = true; }
         return rejected && ClaudeImageSlider.SelfTest() && GptImageSlider.SelfTest() ? 0 : 1;
